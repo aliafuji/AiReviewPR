@@ -255,6 +255,185 @@ export async function post({
 }
 
 /**
+ * Enhanced HTTP/HTTPS GET request with robust error handling
+ * @param options - Request configuration
+ * @returns Promise resolving to parsed response
+ */
+export async function get({
+  url,
+  header = {},
+  json = true,
+  timeout = 30000
+}: {
+  url: string;
+  header?: Record<string, string>;
+  json?: boolean;
+  timeout?: number;
+}): Promise<any> {
+  
+  return new Promise((resolve, reject) => {
+    // Validate inputs
+    if (!url || typeof url !== 'string') {
+      reject(new Error('URL is required and must be a string'));
+      return;
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch (error) {
+      reject(new Error(`Invalid URL format: ${url}. Error: ${error instanceof Error ? error.message : String(error)}`));
+      return;
+    }
+
+    // Setup headers with defaults
+    const headers = {
+      'User-Agent': 'AI-Review-Bot/1.0',
+      ...header
+    };
+
+    // Request options with SSL bypass for HTTPS
+    const requestOptions: any = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + (parsedUrl.search || ''),
+      method: 'GET',
+      headers: headers,
+      timeout: timeout
+    };
+
+    // For HTTPS requests, disable SSL verification to handle proxy certificates
+    if (parsedUrl.protocol === 'https:') {
+      requestOptions.rejectUnauthorized = false;
+      requestOptions.requestCert = false;
+      requestOptions.agent = false;
+    }
+
+    console.log(`🌐 Making ${parsedUrl.protocol.toUpperCase()} GET request to: ${parsedUrl.hostname}:${requestOptions.port}`);
+    console.log(`   Path: ${requestOptions.path}`);
+
+    // Create request
+    const client = parsedUrl.protocol === 'http:' ? http : https;
+    const req = client.request(requestOptions, (res) => {
+      let responseBody = '';
+      let charset: BufferEncoding = 'utf-8';
+
+      // Handle response status codes
+      const statusCode = res.statusCode || 0;
+      console.log(`📡 Response status: ${statusCode} ${res.statusMessage || ''}`);
+
+      if (statusCode < 200 || statusCode >= 300) {
+        console.error(`❌ HTTP Error: ${statusCode} ${res.statusMessage}`);
+        console.error(`   Response headers:`, res.headers);
+      }
+
+      // Parse content-type for encoding
+      const contentType = res.headers['content-type'];
+      if (contentType) {
+        const charsetMatch = contentType.match(/charset=([\w-]+)/i);
+        if (charsetMatch) {
+          const detectedCharset = charsetMatch[1].toLowerCase();
+          switch (detectedCharset) {
+            case 'utf-8':
+              charset = 'utf-8';
+              break;
+            case 'ascii':
+              charset = 'ascii';
+              break;
+            case 'gbk':
+              // GBK is not directly supported, fallback to ascii
+              charset = 'ascii';
+              break;
+            default:
+              charset = 'utf-8';
+          }
+        }
+      }
+
+      res.setEncoding(charset);
+
+      // Collect response data
+      res.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+
+      // Handle response completion
+      res.on('end', () => {
+        console.log(`📥 Response received: ${responseBody.length} characters`);
+        
+        try {
+          if (json) {
+            // Attempt to parse JSON
+            if (!responseBody.trim()) {
+              reject(new Error('Empty response body when JSON was expected'));
+              return;
+            }
+            
+            const parsedResponse = JSON.parse(responseBody);
+            
+            // Handle HTTP error status codes even with valid JSON
+            if (statusCode < 200 || statusCode >= 300) {
+              reject(new Error(`HTTP ${statusCode}: ${res.statusMessage}. Response: ${JSON.stringify(parsedResponse)}`));
+              return;
+            }
+            
+            resolve(parsedResponse);
+          } else {
+            // Return raw text
+            if (statusCode < 200 || statusCode >= 300) {
+              reject(new Error(`HTTP ${statusCode}: ${res.statusMessage}. Response: ${responseBody}`));
+              return;
+            }
+            
+            resolve(responseBody);
+          }
+        } catch (parseError) {
+          console.error(`❌ Failed to parse response as ${json ? 'JSON' : 'text'}`);
+          console.error(`   Parse error: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
+          console.error(`   Response body: ${responseBody.substring(0, 500)}${responseBody.length > 500 ? '...' : ''}`);
+          reject(new Error(`Failed to parse response: ${parseError instanceof Error ? parseError.message : String(parseError)}. Response: ${responseBody.substring(0, 200)}`));
+        }
+      });
+    });
+
+    // Handle request errors
+    req.on('error', (error) => {
+      console.error(`❌ Request error: ${error.message}`);
+      console.error(`   Error code: ${(error as any).code || 'Unknown'}`);
+      console.error(`   URL: ${url}`);
+      
+      // Provide more specific error messages
+      let errorMessage = `Request failed: ${error.message}`;
+      
+      const errorCode = (error as any).code;
+      if (errorCode === 'ENOTFOUND') {
+        errorMessage = `DNS lookup failed for hostname: ${parsedUrl.hostname}. Please check the URL.`;
+      } else if (errorCode === 'ECONNREFUSED') {
+        errorMessage = `Connection refused to ${parsedUrl.hostname}:${requestOptions.port}. Please check if the service is running.`;
+      } else if (errorCode === 'ETIMEDOUT') {
+        errorMessage = `Request timed out after ${timeout}ms. The service may be slow or unresponsive.`;
+      } else if (errorCode === 'CERT_HAS_EXPIRED') {
+        errorMessage = `SSL certificate has expired for ${parsedUrl.hostname}.`;
+      } else if (errorCode === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+        errorMessage = `SSL certificate verification failed for ${parsedUrl.hostname}. This may be due to a self-signed or invalid certificate.`;
+      }
+      
+      reject(new Error(errorMessage));
+    });
+
+    // Handle request timeout
+    req.on('timeout', () => {
+      console.error(`⏱️  Request timeout after ${timeout}ms`);
+      req.destroy();
+      reject(new Error(`Request timeout after ${timeout}ms. The service may be slow or unresponsive.`));
+    });
+
+    // End the request (no body for GET)
+    req.end();
+  });
+}
+
+/**
  * Helper function to test connectivity to an endpoint
  * @param url - URL to test
  * @returns Promise resolving to connection test result
@@ -263,9 +442,8 @@ export async function testConnection(url: string): Promise<{success: boolean, me
   const startTime = Date.now();
   
   try {
-    await post({
+    await get({
       url: `${url}/api/tags`,
-      body: {},
       timeout: 10000
     });
     
