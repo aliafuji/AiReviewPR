@@ -3,7 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const node_child_process_1 = require("node:child_process");
 const utils_1 = require("./utils");
 const prompt_1 = require("./prompt");
-// Configuration with robust defaults and validation
+// Enhanced configuration with better timeout handling
 const config = {
     useChinese: false,
     language: "English",
@@ -13,8 +13,10 @@ const config = {
     excludeFiles: (0, utils_1.split_message)(process.env.INPUT_EXCLUDE_FILES || ""),
     reviewPullRequest: process.env.INPUT_REVIEW_PULL_REQUEST?.toLowerCase() === "true",
     maxRetries: 3,
-    retryDelay: 2000,
-    timeout: 30000, // 30 seconds
+    retryDelay: 5000,
+    timeout: 120000,
+    connectionTimeout: 10000,
+    maxPromptLength: 8000, // Limit prompt length to avoid overwhelming the model
 };
 const systemPrompt = config.reviewersPrompt || (0, prompt_1.take_system_prompt)(config.promptGenre, config.language);
 // Validate required environment variables
@@ -44,11 +46,35 @@ function validateEnvironment() {
     console.log(`   - Host: ${url}`);
     console.log(`   - Model: ${model}`);
     console.log(`   - Review Pull Request: ${config.reviewPullRequest}`);
+    console.log(`   - AI Timeout: ${config.timeout}ms`);
+    console.log(`   - Max Prompt Length: ${config.maxPromptLength} chars`);
     return { url, model };
 }
 const { url, model } = validateEnvironment();
-// Utility function for retrying operations
-async function withRetry(operation, operationName, maxRetries = config.maxRetries) {
+// Test Ollama connectivity before proceeding
+async function testOllamaConnection() {
+    console.log("🔌 Testing Ollama connectivity...");
+    try {
+        const result = await (0, utils_1.testConnection)(url);
+        if (result.success) {
+            console.log(`✅ Ollama connection successful (${result.responseTime}ms)`);
+        }
+        else {
+            console.error(`❌ Ollama connection failed: ${result.message}`);
+            console.error("   Please check:");
+            console.error("   1. Is Ollama running and accessible?");
+            console.error("   2. Is the HOST URL correct?");
+            console.error("   3. Are there any network/firewall issues?");
+            throw new Error(`Ollama connectivity test failed: ${result.message}`);
+        }
+    }
+    catch (error) {
+        console.error("❌ Failed to test Ollama connectivity");
+        throw error;
+    }
+}
+// Utility function for retrying operations with exponential backoff
+async function withRetry(operation, operationName, maxRetries = config.maxRetries, useExponentialBackoff = false) {
     let lastError;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -59,9 +85,19 @@ async function withRetry(operation, operationName, maxRetries = config.maxRetrie
             lastError = error;
             console.error(`❌ Attempt ${attempt} failed for ${operationName}:`);
             console.error(`   Error: ${lastError.message}`);
+            // Check for specific errors that might indicate service issues
+            const errorMessage = lastError.message.toLowerCase();
+            if (errorMessage.includes('socket hang up') ||
+                errorMessage.includes('econnreset') ||
+                errorMessage.includes('timeout')) {
+                console.error("   ⚠️  This appears to be a connectivity/timeout issue");
+            }
             if (attempt < maxRetries) {
-                console.log(`⏳ Waiting ${config.retryDelay}ms before retry...`);
-                await new Promise(resolve => setTimeout(resolve, config.retryDelay));
+                const delay = useExponentialBackoff
+                    ? config.retryDelay * Math.pow(2, attempt - 1)
+                    : config.retryDelay;
+                console.log(`⏳ Waiting ${delay}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
     }
@@ -85,12 +121,12 @@ async function pushComments(message) {
     }
     const apiUrl = process.env.GITHUB_API_URL || "https://api.github.com";
     const isGitea = apiUrl.includes('/api/v1') || apiUrl.includes('gitea');
-    const endpoint = `${apiUrl}/repos/${process.env.INPUT_REPOSITORY}/issues/${process.env.INPUT_PULL_REQUEST_NUMBER}/comments`;
+    const endpoint = `${apiUrl}/repos/${repository}/issues/${pullRequestNumber}/comments`;
     console.log(`📤 Posting comment to PR #${pullRequestNumber} in ${repository}`);
     console.log('API Details:');
     console.log('- Endpoint:', endpoint);
     console.log('- Is Gitea:', isGitea);
-    console.log('- Has Token:', !!process.env.INPUT_TOKEN);
+    console.log('- Has Token:', !!token);
     return await withRetry(async () => {
         return await (0, utils_1.post)({
             url: endpoint,
@@ -99,17 +135,40 @@ async function pushComments(message) {
                 'Authorization': `token ${token}`,
                 'Accept': 'application/vnd.github.v3+json',
                 'User-Agent': 'AI-Review-Bot'
-            }
+            },
+            timeout: 15000 // Shorter timeout for GitHub API
         });
     }, "push comment");
 }
-// Enhanced AI generation with detailed error handling
+// Function to truncate prompt if it's too long
+function truncatePrompt(prompt, maxLength = config.maxPromptLength) {
+    if (prompt.length <= maxLength) {
+        return prompt;
+    }
+    console.log(`⚠️  Prompt too long (${prompt.length} chars), truncating to ${maxLength} chars`);
+    // Try to truncate intelligently by keeping the header and footer
+    const lines = prompt.split('\n');
+    if (lines.length > 10) {
+        // Keep first 5 and last 5 lines, truncate middle
+        const header = lines.slice(0, 5).join('\n');
+        const footer = lines.slice(-5).join('\n');
+        const truncated = `${header}\n\n[... content truncated for length ...]\n\n${footer}`;
+        if (truncated.length <= maxLength) {
+            return truncated;
+        }
+    }
+    // Simple truncation with ellipsis
+    return prompt.substring(0, maxLength - 50) + '\n\n[... truncated for length ...]';
+}
+// Enhanced AI generation with better error handling and timeout management
 async function aiGenerate({ host, token, prompt, model, system }) {
     if (!prompt?.trim()) {
         throw new Error("Empty or invalid prompt provided to AI generation");
     }
+    // Truncate prompt if too long
+    const truncatedPrompt = truncatePrompt(prompt.trim());
     const requestData = {
-        prompt: prompt.trim(),
+        prompt: truncatedPrompt,
         model: model,
         stream: false,
         system: system || systemPrompt,
@@ -118,12 +177,15 @@ async function aiGenerate({ host, token, prompt, model, system }) {
             top_k: 30,
             top_p: 0.8,
             temperature: 0.7,
-            num_ctx: 10240,
+            num_ctx: 8192,
+            num_predict: 2048, // Limit response length
         }
     };
-    console.log(`🤖 Generating AI review for ${prompt.length} characters of content`);
+    console.log(`🤖 Generating AI review:`);
     console.log(`   - Model: ${model}`);
     console.log(`   - Host: ${host}`);
+    console.log(`   - Prompt length: ${truncatedPrompt.length} chars`);
+    console.log(`   - Timeout: ${config.timeout}ms`);
     return await withRetry(async () => {
         const response = await (0, utils_1.post)({
             url: `${host}/api/generate`,
@@ -131,7 +193,8 @@ async function aiGenerate({ host, token, prompt, model, system }) {
             header: {
                 'Authorization': token ? `Bearer ${token}` : "",
                 'Content-Type': 'application/json'
-            }
+            },
+            timeout: config.timeout // Use longer timeout for AI calls
         });
         // Validate response structure
         if (!response) {
@@ -146,8 +209,9 @@ async function aiGenerate({ host, token, prompt, model, system }) {
         if (!response.response) {
             throw new Error("AI service returned no response content");
         }
+        console.log(`✅ AI response received (${response.response.length} chars)`);
         return response;
-    }, "AI generation", 2); // Fewer retries for AI calls
+    }, "AI generation", 2, true); // Use exponential backoff for AI calls
 }
 // Enhanced diff context retrieval with better error handling
 async function getPrDiffContext() {
@@ -189,11 +253,15 @@ async function getPrDiffContext() {
                     stdio: 'pipe'
                 });
                 if (fileDiffOutput.trim()) {
+                    // Limit diff size to prevent overwhelming the AI
+                    const limitedDiff = fileDiffOutput.length > 10000
+                        ? fileDiffOutput.substring(0, 10000) + '\n... [diff truncated for length]'
+                        : fileDiffOutput;
                     items.push({
                         path: file,
-                        context: fileDiffOutput
+                        context: limitedDiff
                     });
-                    console.log(`✅ Added diff context for: ${file} (${fileDiffOutput.length} characters)`);
+                    console.log(`✅ Added diff context for: ${file} (${limitedDiff.length} characters)`);
                 }
                 else {
                     console.log(`⚠️  No diff content found for: ${file}`);
@@ -246,9 +314,13 @@ async function getHeadDiffContext() {
                     stdio: 'pipe'
                 });
                 if (fileDiffOutput.trim()) {
+                    // Limit diff size
+                    const limitedDiff = fileDiffOutput.length > 10000
+                        ? fileDiffOutput.substring(0, 10000) + '\n... [diff truncated for length]'
+                        : fileDiffOutput;
                     items.push({
                         path: file,
-                        context: fileDiffOutput
+                        context: limitedDiff
                     });
                     console.log(`✅ Added diff context for: ${file}`);
                 }
@@ -264,11 +336,13 @@ async function getHeadDiffContext() {
     }
     return items;
 }
-// Enhanced main function with comprehensive error handling
+// Enhanced main function with comprehensive error handling and better resilience
 async function aiCheckDiffContext() {
     console.log(`🚀 Starting AI code review process...`);
     console.log(`   - Review mode: ${config.reviewPullRequest ? 'Pull Request' : 'HEAD commit'}`);
     try {
+        // Test Ollama connectivity first
+        await testOllamaConnection();
         const commitShaUrl = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${process.env.INPUT_REPOSITORY}/commit/${process.env.GITHUB_SHA}`;
         // Get diff context based on review mode
         const items = config.reviewPullRequest
@@ -281,10 +355,16 @@ async function aiCheckDiffContext() {
         console.log(`📝 Starting review of ${items.length} files...`);
         let successCount = 0;
         let errorCount = 0;
+        const failedFiles = [];
         for (let i = 0; i < items.length; i++) {
             const item = items[i];
             console.log(`\n📄 Processing file ${i + 1}/${items.length}: ${item.path}`);
             try {
+                // Add a small delay between requests to avoid overwhelming the server
+                if (i > 0) {
+                    console.log("⏳ Waiting 2s before next request...");
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
                 // Generate AI review
                 const response = await aiGenerate({
                     host: url,
@@ -302,10 +382,19 @@ async function aiCheckDiffContext() {
                         commit = commit.substring(0, commit.length - 3);
                     }
                 }
-                // Create comment
+                // Create comment with additional context
                 const reviewTitle = "🤖 AI Code Review";
                 const fileUrl = `${commitShaUrl}/${item.path}`;
-                const comments = `# ${reviewTitle}\n**File:** [${item.path}](${fileUrl})\n\n${commit.trim()}`;
+                const timestamp = new Date().toISOString();
+                const comments = `# ${reviewTitle}
+**File:** [${item.path}](${fileUrl})
+**Model:** ${model}
+**Reviewed at:** ${timestamp}
+
+${commit.trim()}
+
+---
+*This review was generated automatically by AI. Please review the suggestions carefully before implementing.*`;
                 // Post comment
                 const resp = await pushComments(comments);
                 if (!resp?.id) {
@@ -318,6 +407,7 @@ async function aiCheckDiffContext() {
                 console.error(`❌ Failed to process file ${item.path}:`);
                 console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
                 errorCount++;
+                failedFiles.push(item.path);
                 // Continue processing other files instead of failing completely
             }
         }
@@ -326,19 +416,33 @@ async function aiCheckDiffContext() {
         console.log(`   ✅ Successfully reviewed: ${successCount} files`);
         console.log(`   ❌ Failed to review: ${errorCount} files`);
         console.log(`   📁 Total files processed: ${items.length}`);
+        if (failedFiles.length > 0) {
+            console.log(`   Failed files: ${failedFiles.join(', ')}`);
+        }
+        // Only fail if all files failed to be reviewed
         if (errorCount > 0 && successCount === 0) {
-            throw new Error(`All ${items.length} files failed to be reviewed`);
+            throw new Error(`All ${items.length} files failed to be reviewed. Please check Ollama connectivity and configuration.`);
+        }
+        if (errorCount > 0 && successCount > 0) {
+            console.log(`⚠️  Partial success: ${successCount} files reviewed, ${errorCount} files failed`);
         }
     }
     catch (error) {
         console.error(`💥 Critical error in aiCheckDiffContext:`);
         console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
         console.error(`   Stack: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+        // Provide helpful debugging information
+        console.error(`\n🔧 Debugging Information:`);
+        console.error(`   - Ollama Host: ${url}`);
+        console.error(`   - Model: ${model}`);
+        console.error(`   - Timeout: ${config.timeout}ms`);
+        console.error(`   - Max Retries: ${config.maxRetries}`);
         process.exit(1);
     }
 }
 // Main execution with graceful error handling
 console.log("🎯 AI Code Review Bot Starting...");
+console.log(`⚙️  Configuration: timeout=${config.timeout}ms, retries=${config.maxRetries}, delay=${config.retryDelay}ms`);
 aiCheckDiffContext()
     .then(() => {
     console.log("🎉 Code review process completed successfully!");
@@ -348,5 +452,16 @@ aiCheckDiffContext()
     console.error("💥 Code review process failed:");
     console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
     console.error(`   Stack: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
-    process.exit(1);
+    // Exit with appropriate codes
+    if (error.message.includes('connectivity') || error.message.includes('timeout')) {
+        console.error("\n🔧 Suggested fixes:");
+        console.error("   1. Check if Ollama is running and accessible");
+        console.error("   2. Verify network connectivity");
+        console.error("   3. Consider increasing timeout values");
+        console.error("   4. Check if the model is loaded in Ollama");
+        process.exit(2); // Network/connectivity issue
+    }
+    else {
+        process.exit(1); // General error
+    }
 });
