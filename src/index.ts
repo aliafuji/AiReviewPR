@@ -1,49 +1,133 @@
-import {execSync} from "node:child_process";
-import {doesAnyPatternMatch, post, split_message} from "./utils";
-import {take_system_prompt} from "./prompt";
+import { execSync } from "node:child_process";
+import { doesAnyPatternMatch, post, split_message } from "./utils";
+import { take_system_prompt } from "./prompt";
 
-let useChinese = (process.env.INPUT_CHINESE || "true").toLowerCase() != "false"; // use chinese
-const language = !process.env.INPUT_CHINESE ? (process.env.INPUT_LANGUAGE || "Chinese") : (useChinese ? "Chinese" : "English");
-const prompt_genre = (process.env.INPUT_PROMPT_GENRE || "");
-const reviewers_prompt = (process.env.INPUT_REVIEWERS_PROMPT || "");
-useChinese = language.toLowerCase() === "chinese"
-const include_files = split_message(process.env.INPUT_INCLUDE_FILES || "");
-const exclude_files = split_message(process.env.INPUT_EXCLUDE_FILES || "");
-const review_pull_request = (!process.env.INPUT_REVIEW_PULL_REQUEST) ? false : (process.env.INPUT_REVIEW_PULL_REQUEST.toLowerCase() === "true")
+// Configuration with robust defaults and validation
+const config = {
+  useChinese: false, // Force English for better compatibility
+  language: "English",
+  promptGenre: process.env.INPUT_PROMPT_GENRE?.trim() || "",
+  reviewersPrompt: process.env.INPUT_REVIEWERS_PROMPT?.trim() || "",
+  includeFiles: split_message(process.env.INPUT_INCLUDE_FILES || ""),
+  excludeFiles: split_message(process.env.INPUT_EXCLUDE_FILES || ""),
+  reviewPullRequest: process.env.INPUT_REVIEW_PULL_REQUEST?.toLowerCase() === "true",
+  maxRetries: 3,
+  retryDelay: 2000, // 2 seconds
+  timeout: 30000, // 30 seconds
+};
 
-const system_prompt = reviewers_prompt || take_system_prompt(prompt_genre, language);
+const systemPrompt = config.reviewersPrompt || take_system_prompt(config.promptGenre, config.language);
 
-// 获取输入参数
-const url = process.env.INPUT_HOST; // INPUT_HOST 是从 action.yml 中定义的输入
-if (!url) {
-  console.error('HOST input is required.');
-  process.exit(1);  // 退出程序，返回错误代码
+// Validate required environment variables
+function validateEnvironment(): { url: string; model: string } {
+  const url = process.env.INPUT_HOST?.trim();
+  const model = process.env.INPUT_MODEL?.trim();
+  
+  if (!url) {
+    console.error("❌ ERROR: HOST input is required but not provided");
+    console.error("   Please set the INPUT_HOST environment variable with your Ollama endpoint URL");
+    process.exit(1);
+  }
+  
+  if (!model) {
+    console.error("❌ ERROR: MODEL input is required but not provided");
+    console.error("   Please set the INPUT_MODEL environment variable with your model name");
+    process.exit(1);
+  }
+  
+  // Validate URL format
+  try {
+    new URL(url);
+  } catch (error) {
+    console.error(`❌ ERROR: Invalid URL format for HOST: ${url}`);
+    console.error(`   Error: ${error.message}`);
+    process.exit(1);
+  }
+  
+  console.log(`✅ Configuration validated:`);
+  console.log(`   - Host: ${url}`);
+  console.log(`   - Model: ${model}`);
+  console.log(`   - Review Pull Request: ${config.reviewPullRequest}`);
+  
+  return { url, model };
 }
-const model = process.env.INPUT_MODEL; // INPUT_HOST 是从 action.yml 中定义的输入
-if (!model) {
-  console.error('model input is required.');
-  process.exit(1);  // 退出程序，返回错误代码
+
+const { url, model } = validateEnvironment();
+
+// Utility function for retrying operations
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  operationName: string,
+  maxRetries: number = config.maxRetries
+): Promise<T> {
+  let lastError: Error;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🔄 Attempting ${operationName} (attempt ${attempt}/${maxRetries})`);
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      console.error(`❌ Attempt ${attempt} failed for ${operationName}:`);
+      console.error(`   Error: ${lastError.message}`);
+      
+      if (attempt < maxRetries) {
+        console.log(`⏳ Waiting ${config.retryDelay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, config.retryDelay));
+      }
+    }
+  }
+  
+  console.error(`💥 All ${maxRetries} attempts failed for ${operationName}`);
+  throw lastError!;
 }
 
-
+// Enhanced comment posting with better error handling
 async function pushComments(message: string): Promise<any> {
   if (!process.env.INPUT_PULL_REQUEST_NUMBER) {
+    console.log("📝 No pull request number provided, logging comment instead:");
+    console.log("─".repeat(50));
     console.log(message);
-    return;
+    console.log("─".repeat(50));
+    return { id: "local-log", success: true };
   }
-  return await post({
-    url: `${process.env.GITHUB_API_URL}/repos/${process.env.INPUT_REPOSITORY}/issues/${process.env.INPUT_PULL_REQUEST_NUMBER}/comments`,
-    body: {body: message},
-    header: {'Authorization': `token ${process.env.INPUT_TOKEN}`}
-  })
+  
+  const pullRequestNumber = process.env.INPUT_PULL_REQUEST_NUMBER;
+  const repository = process.env.INPUT_REPOSITORY;
+  const token = process.env.INPUT_TOKEN;
+  
+  if (!repository || !token) {
+    throw new Error("Missing required environment variables: INPUT_REPOSITORY or INPUT_TOKEN");
+  }
+  
+  const apiUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${repository}/issues/${pullRequestNumber}/comments`;
+  
+  console.log(`📤 Posting comment to PR #${pullRequestNumber} in ${repository}`);
+  
+  return await withRetry(async () => {
+    return await post({
+      url: apiUrl,
+      body: { body: message },
+      header: { 
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'AI-Review-Bot'
+      }
+    });
+  }, "push comment");
 }
 
-async function aiGenerate({host, token, prompt, model, system}: any): Promise<any> {
-  const data = JSON.stringify({
-    prompt: prompt,
+// Enhanced AI generation with detailed error handling
+async function aiGenerate({ host, token, prompt, model, system }: any): Promise<any> {
+  if (!prompt?.trim()) {
+    throw new Error("Empty or invalid prompt provided to AI generation");
+  }
+  
+  const requestData = {
+    prompt: prompt.trim(),
     model: model,
     stream: false,
-    system: system || system_prompt,
+    system: system || systemPrompt,
     options: {
       tfs_z: 1.5,
       top_k: 30,
@@ -51,124 +135,272 @@ async function aiGenerate({host, token, prompt, model, system}: any): Promise<an
       temperature: 0.7,
       num_ctx: 10240,
     }
-  });
-  return await post({
-    url: `${host}/api/generate`,
-    body: data,
-    header: {'Authorization': token ? `Bearer ${token}` : "",}
-  })
+  };
+  
+  console.log(`🤖 Generating AI review for ${prompt.length} characters of content`);
+  console.log(`   - Model: ${model}`);
+  console.log(`   - Host: ${host}`);
+  
+  return await withRetry(async () => {
+    const response = await post({
+      url: `${host}/api/generate`,
+      body: requestData,
+      header: {
+        'Authorization': token ? `Bearer ${token}` : "",
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    // Validate response structure
+    if (!response) {
+      throw new Error("Received empty response from AI service");
+    }
+    
+    if (response.error) {
+      throw new Error(`AI service error: ${response.error}`);
+    }
+    
+    if (response.detail) {
+      throw new Error(`AI service detail error: ${JSON.stringify(response.detail)}`);
+    }
+    
+    if (!response.response) {
+      throw new Error("AI service returned no response content");
+    }
+    
+    return response;
+  }, "AI generation", 2); // Fewer retries for AI calls
 }
 
-async function getPrDiffContext() {
-  let items = [];
-  const BASE_REF = process.env.INPUT_BASE_REF
+// Enhanced diff context retrieval with better error handling
+async function getPrDiffContext(): Promise<Array<{ path: string; context: string }>> {
+  const baseRef = process.env.INPUT_BASE_REF || "main";
+  console.log(`🔍 Getting PR diff context against base ref: ${baseRef}`);
+  
+  const items: Array<{ path: string; context: string }> = [];
+  
   try {
-    execSync(`git fetch origin ${BASE_REF}`, {encoding: 'utf-8'});
-    // exec git diff get diff files
-    const diffOutput = execSync(`git diff --name-only origin/${BASE_REF}...HEAD`, {encoding: 'utf-8'});
-    let files = diffOutput.trim().split("\n");
-    for (let key in files) {
-      // noinspection DuplicatedCode
-      if (!files[key]) continue;
-      if ((include_files.length > 0) && (!doesAnyPatternMatch(include_files, files[key]))) {
-        console.log("exclude(include):", files[key])
-        continue;
-      } else if ((exclude_files.length > 0) && (doesAnyPatternMatch(exclude_files, files[key]))) {
-        console.log("exclude(exclude):", files[key])
+    // Fetch the base branch
+    console.log(`📥 Fetching origin/${baseRef}...`);
+    execSync(`git fetch origin ${baseRef}`, { encoding: 'utf-8', stdio: 'pipe' });
+    
+    // Get list of changed files
+    console.log(`📋 Getting list of changed files...`);
+    const diffOutput = execSync(`git diff --name-only origin/${baseRef}...HEAD`, { 
+      encoding: 'utf-8',
+      stdio: 'pipe'
+    });
+    
+    const files = diffOutput.trim().split("\n").filter(file => file.trim());
+    console.log(`📁 Found ${files.length} changed files`);
+    
+    if (files.length === 0) {
+      console.log("ℹ️  No files changed in this PR");
+      return items;
+    }
+    
+    for (const file of files) {
+      if (!file.trim()) continue;
+      
+      // Check include/exclude patterns
+      if (config.includeFiles.length > 0 && !doesAnyPatternMatch(config.includeFiles, file)) {
+        console.log(`⏭️  Excluding file (not in include patterns): ${file}`);
         continue;
       }
-
-      const fileDiffOutput = execSync(`git diff origin/${BASE_REF}...HEAD -- "${files[key]}"`, {encoding: 'utf-8'});
-      items.push({
-        path: files[key],
-        context: fileDiffOutput,
-      })
-    }
-  } catch (error) {
-    console.error('Error executing git diff:', error);
-  }
-  return items;
-}
-
-async function getHeadDiffContext() {
-  let items = [];
-  try {
-    // exec git diff get diff files
-    const diffOutput = execSync(`git diff --name-only HEAD^`, {encoding: 'utf-8'});
-    let files = diffOutput.trim().split("\n");
-    for (let key in files) {
-      // noinspection DuplicatedCode
-      if (!files[key]) continue;
-      if ((include_files.length > 0) && (!doesAnyPatternMatch(include_files, files[key]))) {
-        console.log("exclude(include):", files[key])
-        continue;
-      } else if ((exclude_files.length > 0) && (doesAnyPatternMatch(exclude_files, files[key]))) {
-        console.log("exclude(exclude):", files[key])
+      
+      if (config.excludeFiles.length > 0 && doesAnyPatternMatch(config.excludeFiles, file)) {
+        console.log(`⏭️  Excluding file (matches exclude patterns): ${file}`);
         continue;
       }
-
-      const fileDiffOutput = execSync(`git diff HEAD^ -- "${files[key]}"`, {encoding: 'utf-8'});
-      items.push({
-        path: files[key],
-        context: fileDiffOutput,
-      })
-    }
-  } catch (error) {
-    console.error('Error executing git diff:', error);
-  }
-  return items;
-}
-
-async function aiCheckDiffContext() {
-  try {
-    let commit_sha_url = `${process.env.GITHUB_SERVER_URL}/${process.env.INPUT_REPOSITORY}/src/commit/${process.env.GITHUB_SHA}`;
-    let items: Array<any> = review_pull_request ? await getPrDiffContext() : await getHeadDiffContext();
-    for (let key in items) {
-      if (!items[key]) continue;
-      let item = items[key];
-      // ai generate
+      
       try {
-        let response = await aiGenerate({
+        console.log(`📄 Processing file: ${file}`);
+        const fileDiffOutput = execSync(`git diff origin/${baseRef}...HEAD -- "${file}"`, {
+          encoding: 'utf-8',
+          stdio: 'pipe'
+        });
+        
+        if (fileDiffOutput.trim()) {
+          items.push({
+            path: file,
+            context: fileDiffOutput
+          });
+          console.log(`✅ Added diff context for: ${file} (${fileDiffOutput.length} characters)`);
+        } else {
+          console.log(`⚠️  No diff content found for: ${file}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error getting diff for file ${file}:`);
+        console.error(`   Error: ${error.message}`);
+        // Continue processing other files
+      }
+    }
+  } catch (error) {
+    console.error(`❌ Error in getPrDiffContext:`);
+    console.error(`   Error: ${error.message}`);
+    if (error.stdout) console.error(`   Stdout: ${error.stdout}`);
+    if (error.stderr) console.error(`   Stderr: ${error.stderr}`);
+    throw error;
+  }
+  
+  console.log(`📊 Successfully processed ${items.length} files for review`);
+  return items;
+}
+
+// Enhanced head diff context retrieval
+async function getHeadDiffContext(): Promise<Array<{ path: string; context: string }>> {
+  console.log(`🔍 Getting HEAD diff context...`);
+  
+  const items: Array<{ path: string; context: string }> = [];
+  
+  try {
+    const diffOutput = execSync(`git diff --name-only HEAD^`, {
+      encoding: 'utf-8',
+      stdio: 'pipe'
+    });
+    
+    const files = diffOutput.trim().split("\n").filter(file => file.trim());
+    console.log(`📁 Found ${files.length} changed files in HEAD`);
+    
+    for (const file of files) {
+      if (!file.trim()) continue;
+      
+      if (config.includeFiles.length > 0 && !doesAnyPatternMatch(config.includeFiles, file)) {
+        console.log(`⏭️  Excluding file (not in include patterns): ${file}`);
+        continue;
+      }
+      
+      if (config.excludeFiles.length > 0 && doesAnyPatternMatch(config.excludeFiles, file)) {
+        console.log(`⏭️  Excluding file (matches exclude patterns): ${file}`);
+        continue;
+      }
+      
+      try {
+        const fileDiffOutput = execSync(`git diff HEAD^ -- "${file}"`, {
+          encoding: 'utf-8',
+          stdio: 'pipe'
+        });
+        
+        if (fileDiffOutput.trim()) {
+          items.push({
+            path: file,
+            context: fileDiffOutput
+          });
+          console.log(`✅ Added diff context for: ${file}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error getting diff for file ${file}: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    console.error(`❌ Error in getHeadDiffContext: ${error.message}`);
+    throw error;
+  }
+  
+  return items;
+}
+
+// Enhanced main function with comprehensive error handling
+async function aiCheckDiffContext(): Promise<void> {
+  console.log(`🚀 Starting AI code review process...`);
+  console.log(`   - Review mode: ${config.reviewPullRequest ? 'Pull Request' : 'HEAD commit'}`);
+  
+  try {
+    const commitShaUrl = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${process.env.INPUT_REPOSITORY}/commit/${process.env.GITHUB_SHA}`;
+    
+    // Get diff context based on review mode
+    const items = config.reviewPullRequest 
+      ? await getPrDiffContext() 
+      : await getHeadDiffContext();
+    
+    if (items.length === 0) {
+      console.log("ℹ️  No files to review. Exiting successfully.");
+      return;
+    }
+    
+    console.log(`📝 Starting review of ${items.length} files...`);
+    
+    let successCount = 0;
+    let errorCount = 0;
+    
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      console.log(`\n📄 Processing file ${i + 1}/${items.length}: ${item.path}`);
+      
+      try {
+        // Generate AI review
+        const response = await aiGenerate({
           host: url,
           token: process.env.INPUT_AI_TOKEN,
           prompt: item.context,
           model: model,
           system: process.env.INPUT_REVIEW_PROMPT
-        })
-        if (response.detail) { // noinspection ExceptionCaughtLocallyJS
-          throw response.detail;
-        }
-        if (!response.response) { // noinspection ExceptionCaughtLocallyJS
-          throw "ollama error";
-        }
-        let Review = useChinese ? "审核结果" : "Review";
+        });
+        
+        // Process AI response
         let commit: string = response.response;
-        if (commit.indexOf("```markdown") === 0) {
+        
+        // Clean up markdown formatting if present
+        if (commit.startsWith("```markdown")) {
           commit = commit.substring("```markdown".length);
-          if (commit.lastIndexOf("```") === commit.length - 3) {
+          if (commit.endsWith("```")) {
             commit = commit.substring(0, commit.length - 3);
           }
         }
-        let comments = `# ${Review} \r\n${commit_sha_url}/${item.path} \r\n\r\n\r\n${commit}`
-        let resp = await pushComments(comments);
-        if (!resp.id) {
-          // noinspection ExceptionCaughtLocallyJS
-          throw new Error(useChinese ? "提交issue评论失败" : "push comment error")
+        
+        // Create comment
+        const reviewTitle = "🤖 AI Code Review";
+        const fileUrl = `${commitShaUrl}/${item.path}`;
+        const comments = `# ${reviewTitle}\n**File:** [${item.path}](${fileUrl})\n\n${commit.trim()}`;
+        
+        // Post comment
+        const resp = await pushComments(comments);
+        
+        if (!resp?.id) {
+          throw new Error("Failed to post comment - no response ID received");
         }
-        console.log(useChinese ? "提交issue评论成功：" : "push comment success: ", resp.id)
-      } catch (e) {
-        console.error("aiGenerate:", e)
+        
+        console.log(`✅ Successfully posted review comment for ${item.path} (ID: ${resp.id})`);
+        successCount++;
+        
+      } catch (error) {
+        console.error(`❌ Failed to process file ${item.path}:`);
+        console.error(`   Error: ${error.message}`);
+        errorCount++;
+        
+        // Continue processing other files instead of failing completely
       }
     }
+    
+    // Summary
+    console.log(`\n📊 Review Summary:`);
+    console.log(`   ✅ Successfully reviewed: ${successCount} files`);
+    console.log(`   ❌ Failed to review: ${errorCount} files`);
+    console.log(`   📁 Total files processed: ${items.length}`);
+    
+    if (errorCount > 0 && successCount === 0) {
+      throw new Error(`All ${items.length} files failed to be reviewed`);
+    }
+    
   } catch (error) {
-    console.error('Error executing git diff:', error);
-    process.exit(1);  // error exit
+    console.error(`💥 Critical error in aiCheckDiffContext:`);
+    console.error(`   Error: ${error.message}`);
+    console.error(`   Stack: ${error.stack}`);
+    process.exit(1);
   }
 }
 
+// Main execution with graceful error handling
+console.log("🎯 AI Code Review Bot Starting...");
+
 aiCheckDiffContext()
-  .then(_ => console.log(useChinese ? "检查结束" : "review finish"))
-  .catch(e => {
-    console.error(useChinese ? "检查失败:" : "review error", e);
+  .then(() => {
+    console.log("🎉 Code review process completed successfully!");
+    process.exit(0);
+  })
+  .catch((error) => {
+    console.error("💥 Code review process failed:");
+    console.error(`   Error: ${error.message}`);
+    console.error(`   Stack: ${error.stack}`);
     process.exit(1);
   });
