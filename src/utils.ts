@@ -55,7 +55,7 @@ export function doesAnyPatternMatch(patterns: Array<string>, str: string): boole
       return regex.test(str);
     } catch (error) {
       console.error(`❌ Invalid regex pattern: ${pattern}`);
-      console.error(`   Error: ${error.message}`);
+      console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   });
@@ -91,7 +91,7 @@ export async function post({
     try {
       parsedUrl = new URL(url);
     } catch (error) {
-      reject(new Error(`Invalid URL format: ${url}. Error: ${error.message}`));
+      reject(new Error(`Invalid URL format: ${url}. Error: ${error instanceof Error ? error.message : String(error)}`));
       return;
     }
 
@@ -204,9 +204,9 @@ export async function post({
           }
         } catch (parseError) {
           console.error(`❌ Failed to parse response as ${json ? 'JSON' : 'text'}`);
-          console.error(`   Parse error: ${parseError.message}`);
+          console.error(`   Parse error: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
           console.error(`   Response body: ${responseBody.substring(0, 500)}${responseBody.length > 500 ? '...' : ''}`);
-          reject(new Error(`Failed to parse response: ${parseError.message}. Response: ${responseBody.substring(0, 200)}`));
+          reject(new Error(`Failed to parse response: ${parseError instanceof Error ? parseError.message : String(parseError)}. Response: ${responseBody.substring(0, 200)}`));
         }
       });
     });
@@ -214,21 +214,22 @@ export async function post({
     // Handle request errors
     req.on('error', (error) => {
       console.error(`❌ Request error: ${error.message}`);
-      console.error(`   Error code: ${error.code || 'Unknown'}`);
+      console.error(`   Error code: ${(error as any).code || 'Unknown'}`);
       console.error(`   URL: ${url}`);
       
       // Provide more specific error messages
       let errorMessage = `Request failed: ${error.message}`;
       
-      if (error.code === 'ENOTFOUND') {
+      const errorCode = (error as any).code;
+      if (errorCode === 'ENOTFOUND') {
         errorMessage = `DNS lookup failed for hostname: ${parsedUrl.hostname}. Please check the URL.`;
-      } else if (error.code === 'ECONNREFUSED') {
+      } else if (errorCode === 'ECONNREFUSED') {
         errorMessage = `Connection refused to ${parsedUrl.hostname}:${requestOptions.port}. Please check if the service is running.`;
-      } else if (error.code === 'ETIMEDOUT') {
+      } else if (errorCode === 'ETIMEDOUT') {
         errorMessage = `Request timed out after ${timeout}ms. The service may be slow or unresponsive.`;
-      } else if (error.code === 'CERT_HAS_EXPIRED') {
+      } else if (errorCode === 'CERT_HAS_EXPIRED') {
         errorMessage = `SSL certificate has expired for ${parsedUrl.hostname}.`;
-      } else if (error.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+      } else if (errorCode === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
         errorMessage = `SSL certificate verification failed for ${parsedUrl.hostname}. This may be due to a self-signed or invalid certificate.`;
       }
       
@@ -247,8 +248,8 @@ export async function post({
       req.write(requestData);
       req.end();
     } catch (writeError) {
-      console.error(`❌ Error writing request data: ${writeError.message}`);
-      reject(new Error(`Failed to send request data: ${writeError.message}`));
+      console.error(`❌ Error writing request data: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
+      reject(new Error(`Failed to send request data: ${writeError instanceof Error ? writeError.message : String(writeError)}`));
     }
   });
 }
@@ -277,7 +278,7 @@ export async function testConnection(url: string): Promise<{success: boolean, me
   } catch (error) {
     return {
       success: false,
-      message: `Connection failed: ${error.message}`
+      message: `Connection failed: ${error instanceof Error ? error.message : String(error)}`
     };
   }
 }

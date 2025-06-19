@@ -40,7 +40,7 @@ function validateEnvironment(): { url: string; model: string } {
     new URL(url);
   } catch (error) {
     console.error(`❌ ERROR: Invalid URL format for HOST: ${url}`);
-    console.error(`   Error: ${error.message}`);
+    console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
   
@@ -100,13 +100,20 @@ async function pushComments(message: string): Promise<any> {
     throw new Error("Missing required environment variables: INPUT_REPOSITORY or INPUT_TOKEN");
   }
   
-  const apiUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${repository}/issues/${pullRequestNumber}/comments`;
+  const apiUrl = process.env.GITHUB_API_URL || "https://api.github.com";
+  const isGitea = apiUrl.includes('/api/v1') || apiUrl.includes('gitea');
+
+  const endpoint = `${apiUrl}/repos/${process.env.INPUT_REPOSITORY}/issues/${process.env.INPUT_PULL_REQUEST_NUMBER}/comments`;
   
   console.log(`📤 Posting comment to PR #${pullRequestNumber} in ${repository}`);
+  console.log('API Details:');
+  console.log('- Endpoint:', endpoint);
+  console.log('- Is Gitea:', isGitea);
+  console.log('- Has Token:', !!process.env.INPUT_TOKEN);
   
   return await withRetry(async () => {
     return await post({
-      url: apiUrl,
+      url: endpoint,
       body: { body: message },
       header: { 
         'Authorization': `token ${token}`,
@@ -231,15 +238,15 @@ async function getPrDiffContext(): Promise<Array<{ path: string; context: string
         }
       } catch (error) {
         console.error(`❌ Error getting diff for file ${file}:`);
-        console.error(`   Error: ${error.message}`);
+        console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
         // Continue processing other files
       }
     }
   } catch (error) {
     console.error(`❌ Error in getPrDiffContext:`);
-    console.error(`   Error: ${error.message}`);
-    if (error.stdout) console.error(`   Stdout: ${error.stdout}`);
-    if (error.stderr) console.error(`   Stderr: ${error.stderr}`);
+    console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
+    if (error && typeof error === 'object' && 'stdout' in error) console.error(`   Stdout: ${error.stdout}`);
+    if (error && typeof error === 'object' && 'stderr' in error) console.error(`   Stderr: ${error.stderr}`);
     throw error;
   }
   
@@ -289,11 +296,11 @@ async function getHeadDiffContext(): Promise<Array<{ path: string; context: stri
           console.log(`✅ Added diff context for: ${file}`);
         }
       } catch (error) {
-        console.error(`❌ Error getting diff for file ${file}: ${error.message}`);
+        console.error(`❌ Error getting diff for file ${file}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   } catch (error) {
-    console.error(`❌ Error in getHeadDiffContext: ${error.message}`);
+    console.error(`❌ Error in getHeadDiffContext: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
   
@@ -365,7 +372,7 @@ async function aiCheckDiffContext(): Promise<void> {
         
       } catch (error) {
         console.error(`❌ Failed to process file ${item.path}:`);
-        console.error(`   Error: ${error.message}`);
+        console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
         errorCount++;
         
         // Continue processing other files instead of failing completely
@@ -384,8 +391,8 @@ async function aiCheckDiffContext(): Promise<void> {
     
   } catch (error) {
     console.error(`💥 Critical error in aiCheckDiffContext:`);
-    console.error(`   Error: ${error.message}`);
-    console.error(`   Stack: ${error.stack}`);
+    console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`   Stack: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
     process.exit(1);
   }
 }
@@ -400,7 +407,7 @@ aiCheckDiffContext()
   })
   .catch((error) => {
     console.error("💥 Code review process failed:");
-    console.error(`   Error: ${error.message}`);
-    console.error(`   Stack: ${error.stack}`);
+    console.error(`   Error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`   Stack: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
     process.exit(1);
   });
